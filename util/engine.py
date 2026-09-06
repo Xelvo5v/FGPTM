@@ -1,0 +1,109 @@
+import torch
+import torch.nn as nn
+from .metrics import accuracy, auc, sensitivity, specificity, AUPRC, mcc_score, precision, recall, f1_score
+import numpy as np
+from tqdm import tqdm
+from pathlib import Path
+# from timm.utils import accuracy
+import util.utils as utils
+import torch.distributed as dist
+
+def train_one_epoch(model: torch.nn.Module, criterion, data_loader,
+                    optimizer: torch.optim.Optimizer, loss_scaler):
+    model.train()
+    device = next(model.parameters()).device
+    total_iter = len(data_loader)
+    print_interval = 5
+    for iter, full_data in enumerate(data_loader):
+        # motif_embed, windows_seq, struct_embed, label = full_data
+        # motif_embed, label, struct_embed = motif_embed.cuda().half(), label.cuda(), struct_embed.cuda().half()
+        full_data = full_data.to(device)
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            preds = model(full_data)
+            loss = criterion(preds, full_data.label.view(-1, 1))
+        optimizer.zero_grad()
+        loss_scaler(loss, optimizer, parameters=model.parameters(), clip_grad=None)
+        if iter % print_interval == 0:
+            cur_lr = optimizer.state_dict()['param_groups'][0]['lr']
+            print("{}/{} lr:{} loss:{}".format(iter, total_iter, cur_lr, loss.item()))
+            
+
+@torch.no_grad()
+def evaluate(model: torch.nn.Module, criterion, data_loader, epoch=0, args=None):
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+    model.eval()
+    device = next(model.parameters()).device
+    preds_item_list = []
+    labels_item_list = []
+    for full_data in metric_logger.log_every(data_loader, 10, header):
+        # motif_embed, windows_seq, struct_embed, label = full_data
+        # motif_embed, label, struct_embed = motif_embed.cuda().half(), label.cuda(), struct_embed.cuda().half()
+        full_data = full_data.to(device)
+        label_list = full_data.label.view(-1, 1)
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            logits = model(full_data)
+            loss = criterion(logits, label_list)
+            preds_list = torch.sigmoid(logits)
+        preds_item_list.append(preds_list)
+        labels_item_list.append(label_list)
+        acc1 = accuracy(label_list.cpu().numpy().copy(), preds_list.cpu().numpy().copy())
+        batch_size = label_list.shape[0]
+        metric_logger.update(loss=loss.item())
+        metric_logger.meters['acc1'].update(acc1, n=batch_size)
+        
+    # gather the stats from all processes
+    preds_item_list = torch.cat(preds_item_list,dim=0)
+    labels_item_list = torch.cat(labels_item_list,dim=0)
+    all_item_list = torch.cat([preds_item_list,labels_item_list],dim=1)
+    if torch.distributed.is_initialized():
+        all_list = [None for _ in range(torch.distributed.get_world_size())]
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            dist.barrier()
+            dist.all_gather_object(all_list, all_item_list)
+        except Exception:
+            return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+        preds_list = [item[:,0].cpu().numpy().copy() for item in all_list]
+        labels_list = [item[:,1].cpu().numpy().copy() for item in all_list]
+        preds_list = np.concatenate(preds_list,axis=0)
+        labels_list = np.concatenate(labels_list,axis=0)
+    else:
+        preds_list = preds_item_list[:, 0].cpu().numpy().copy()
+        labels_list = labels_item_list[:, 0].cpu().numpy().copy()
+    #compute all the metrics
+    acc_all = accuracy(labels_list,preds_list)
+    auc_all = auc(labels_list,preds_list)
+    auprc_all = AUPRC(labels_list, preds_list)
+    pre_score_all = precision(labels_list,preds_list)
+    re_score_all = recall(labels_list,preds_list)
+    f1 = f1_score(labels_list,preds_list)
+    mcc = mcc_score(labels_list,preds_list)
+    sp = specificity(labels_list,preds_list)
+    sn = sensitivity(labels_list, preds_list)
+    metric_logger.synchronize_between_processes()
+    print('* Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
+        .format(top1=metric_logger.acc1, losses=metric_logger.loss))
+    print("auc: {:.4f} precision: {:.4f} recall: {:.4f} f1: {:.4f} mcc:{:.4f} auprc:{:.4f} sp:{:.4f} sn:{:.4f} acc: {:.4f} loss: {losses.global_avg:.4f}"
+          .format(auc_all, pre_score_all, re_score_all, f1, mcc, auprc_all, sp, sn, acc_all, losses=metric_logger.loss))
+    if args is not None and args.output_dir and utils.is_main_process():
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with (output_dir / "log.txt").open("a") as f:
+            f.write("epoch:{:.4f} auc: {:.4f} precision: {:.4f} recall: {:.4f} f1: {:.4f} mcc:{:.4f} auprc:{:.4f} sp:{:.4f} sn:{:.4f} acc: {top1.global_avg:.4f} loss: {losses.global_avg:.4f} \n"
+                    .format(epoch, auc_all, pre_score_all, re_score_all, f1, mcc, auprc_all, sp, sn, top1=metric_logger.acc1, losses=metric_logger.loss))
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats.update({
+        "auc": float(auc_all),
+        "auprc": float(auprc_all),
+        "precision": float(pre_score_all),
+        "recall": float(re_score_all),
+        "f1": float(f1),
+        "mcc": float(mcc),
+        "specificity": float(sp),
+        "sensitivity": float(sn),
+        "accuracy": float(acc_all),
+        "loss": float(metric_logger.loss.global_avg),
+    })
+    return stats
